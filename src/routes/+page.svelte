@@ -19,26 +19,42 @@
   let isDownloading = $state(false);
   let isOpeningResult = $state(false);
   let updateStatus = $state<"updating" | "success" | "error">("updating");
-  let updateMessage = $state("yt-dlpの更新を確認しています...");
-  let isUpdatingYtdlp = $derived(updateStatus === "updating");
+  let updateMessage = $state(
+    "FFmpegとffprobeを確認しています。初回はlibフォルダーへのインストールに時間がかかる場合があります。",
+  );
+  let isInitializing = $derived(updateStatus === "updating");
   let progress = $state("");
   let message = $state("");
   let resultType = $state<"success" | "error" | "">("");
   let hasVideoInfo = $derived(videoInfo !== null && infoForUrl === url.trim());
 
   onMount(() => {
-    void updateYtdlp();
+    void initializeTools();
   });
 
-  async function updateYtdlp() {
+  async function initializeTools() {
+    const messages: string[] = [];
+    let failed = false;
+
     try {
-      updateMessage = await invoke<string>("update_ytdlp");
-      updateStatus = "success";
+      messages.push(await invoke<string>("ensure_ffmpeg_available"));
     } catch (error) {
       const details = error instanceof Error ? error.message : String(error);
-      updateMessage = `yt-dlpの自動更新に失敗しました。現在のバージョンで続行します。\n${details}`;
-      updateStatus = "error";
+      messages.push(`FFmpegとffprobeの準備に失敗しました。\n${details}`);
+      failed = true;
     }
+
+    updateMessage = `${messages.join("\n")}\nyt-dlpを更新しています...`;
+    try {
+      messages.push(await invoke<string>("update_ytdlp"));
+    } catch (error) {
+      const details = error instanceof Error ? error.message : String(error);
+      messages.push(`yt-dlpの自動更新に失敗しました。現在のバージョンで続行します。\n${details}`);
+      failed = true;
+    }
+
+    updateMessage = messages.join("\n");
+    updateStatus = failed ? "error" : "success";
   }
 
   function showError(error: unknown) {
@@ -63,7 +79,7 @@
 
   async function fetchVideoInfo() {
     const requestedUrl = url.trim();
-    if (!requestedUrl || isFetchingInfo || isDownloading || isUpdatingYtdlp) return;
+    if (!requestedUrl || isFetchingInfo || isDownloading || isInitializing) return;
 
     isFetchingInfo = true;
     videoInfo = null;
@@ -87,7 +103,7 @@
 
   async function downloadVideo(event: SubmitEvent) {
     event.preventDefault();
-    if (!hasVideoInfo || isDownloading || isFetchingInfo || isUpdatingYtdlp) return;
+    if (!hasVideoInfo || isDownloading || isFetchingInfo || isInitializing) return;
     if (downloadMode === "video" && selectedQuality === undefined) return;
 
     isDownloading = true;
@@ -145,7 +161,7 @@
             : "border-emerald-400/20 bg-emerald-400/10 text-emerald-200"
       }`}
     >
-      {#if isUpdatingYtdlp}
+      {#if isInitializing}
         <span
           class="mt-0.5 size-3 shrink-0 animate-spin rounded-full border-2 border-slate-400/30 border-t-slate-300"
         ></span>
@@ -167,13 +183,13 @@
           bind:value={url}
           placeholder="https://example.com/video"
           required
-          disabled={isFetchingInfo || isDownloading || isUpdatingYtdlp}
+          disabled={isFetchingInfo || isDownloading || isInitializing}
           class="min-w-0 flex-1 rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm text-white outline-none transition placeholder:text-slate-600 focus:border-cyan-400 focus:ring-2 focus:ring-cyan-400/20 disabled:opacity-60"
         />
         <button
           type="button"
           onclick={fetchVideoInfo}
-          disabled={!url.trim() || isFetchingInfo || isDownloading || isUpdatingYtdlp}
+          disabled={!url.trim() || isFetchingInfo || isDownloading || isInitializing}
           class="rounded-xl border border-slate-700 px-4 py-3 text-sm font-semibold text-slate-200 transition hover:border-cyan-400 hover:text-cyan-300 disabled:cursor-not-allowed disabled:opacity-50"
         >
           {isFetchingInfo ? "取得中..." : "画質を取得"}
@@ -194,7 +210,7 @@
             type="text"
             bind:value={fileName}
             placeholder="空欄の場合は動画タイトルを使用"
-            disabled={isDownloading || isUpdatingYtdlp}
+            disabled={isDownloading || isInitializing}
             maxlength="200"
             class="w-full rounded-xl border border-slate-700 bg-slate-900 px-4 py-3 text-sm text-white outline-none transition placeholder:text-slate-600 focus:border-cyan-400 focus:ring-2 focus:ring-cyan-400/20 disabled:opacity-60"
           />
@@ -246,7 +262,7 @@
               <select
                 id="video-quality"
                 bind:value={selectedQuality}
-                disabled={isDownloading || isUpdatingYtdlp}
+                disabled={isDownloading || isInitializing}
                 class="w-full rounded-xl border border-slate-700 bg-slate-900 px-4 py-3 text-sm text-white outline-none focus:border-cyan-400 focus:ring-2 focus:ring-cyan-400/20 disabled:opacity-60"
               >
                 {#each videoInfo.qualities as quality}
@@ -269,7 +285,7 @@
           type="submit"
           disabled={isDownloading ||
             isFetchingInfo ||
-            isUpdatingYtdlp ||
+            isInitializing ||
             (downloadMode === "video" && selectedQuality === undefined)}
           class="mt-4 flex w-full items-center justify-center gap-2 rounded-xl bg-cyan-400 px-4 py-3 font-semibold text-slate-950 transition hover:bg-cyan-300 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400"
         >

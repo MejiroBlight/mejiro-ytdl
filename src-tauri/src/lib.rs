@@ -4,6 +4,7 @@ use tauri_plugin_opener::OpenerExt;
 use std::process::{Command, Stdio};
 use std::io::{BufRead, BufReader, Read};
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 
 #[derive(serde::Serialize)]
 struct VideoInfo {
@@ -35,10 +36,96 @@ fn open_result_dir(app_handle: AppHandle) -> Result<(), String> {
         .map_err(|error| format!("resultフォルダーを開けませんでした: {error}"))
 }
 
-fn get_lib_dir() -> Result<std::path::PathBuf, String> {
+fn get_lib_dir() -> Result<PathBuf, String> {
     let exe_dir = get_exe_dir()?;
     let lib_dir = exe_dir.join("lib");
     Ok(lib_dir)
+}
+
+fn ffmpeg_binary_name(name: &str) -> String {
+    if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    }
+}
+
+fn command_is_available(command: impl AsRef<std::ffi::OsStr>) -> bool {
+    Command::new(command)
+        .arg("-version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn ffmpeg_tools_are_available_in_cli() -> bool {
+    command_is_available("ffmpeg") && command_is_available("ffprobe")
+}
+
+fn ffmpeg_tools_work_in(directory: &Path) -> bool {
+    command_is_available(directory.join(ffmpeg_binary_name("ffmpeg")))
+        && command_is_available(directory.join(ffmpeg_binary_name("ffprobe")))
+}
+
+fn get_ffmpeg_location(lib_dir: &Path) -> Result<Option<PathBuf>, String> {
+    if ffmpeg_tools_are_available_in_cli() {
+        Ok(None)
+    } else if ffmpeg_tools_work_in(lib_dir) {
+        Ok(Some(lib_dir.to_path_buf()))
+    } else {
+        Err("FFmpegとffprobeが利用できません。アプリを再起動して初期化をやり直してください。".into())
+    }
+}
+
+#[tauri::command]
+async fn ensure_ffmpeg_available() -> Result<String, String> {
+    let lib_dir = get_lib_dir()?;
+
+    tauri::async_runtime::spawn_blocking(move || {
+        if ffmpeg_tools_are_available_in_cli() {
+            return Ok("FFmpegとffprobeはCLIから利用できます。".into());
+        }
+        if ffmpeg_tools_work_in(&lib_dir) {
+            return Ok("FFmpegとffprobeはlibフォルダーにインストール済みです。".into());
+        }
+
+        std::fs::create_dir_all(&lib_dir).map_err(|error| error.to_string())?;
+        let download_url = ffmpeg_sidecar::download::ffmpeg_download_url()
+            .map_err(|error| format!("FFmpegのダウンロード先を取得できません: {error}"))?;
+        let archive = ffmpeg_sidecar::download::download_ffmpeg_package(download_url, &lib_dir)
+            .map_err(|error| format!("FFmpegのダウンロードに失敗しました: {error}"))?;
+
+        for name in ["ffmpeg", "ffprobe", "ffplay"] {
+            let path = lib_dir.join(ffmpeg_binary_name(name));
+            if path.exists() {
+                std::fs::remove_file(&path)
+                    .map_err(|error| format!("既存のFFmpegファイルを置き換えられません: {error}"))?;
+            }
+        }
+        let unpack_dir = lib_dir.join(ffmpeg_sidecar::download::UNPACK_DIRNAME);
+        if unpack_dir.exists() {
+            std::fs::remove_dir_all(&unpack_dir)
+                .map_err(|error| format!("以前のFFmpeg展開データを削除できません: {error}"))?;
+        }
+
+        ffmpeg_sidecar::download::unpack_ffmpeg(&archive, &lib_dir)
+            .map_err(|error| format!("FFmpegの展開に失敗しました: {error}"))?;
+
+        if !ffmpeg_tools_work_in(&lib_dir) {
+            return Err("FFmpegとffprobeをlibフォルダーから起動できませんでした".into());
+        }
+
+        let ffplay_path = lib_dir.join(ffmpeg_binary_name("ffplay"));
+        if ffplay_path.exists() {
+            std::fs::remove_file(ffplay_path)
+                .map_err(|error| format!("不要なffplayファイルを削除できません: {error}"))?;
+        }
+
+        Ok("FFmpegとffprobeをlibフォルダーにインストールしました。".into())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 fn validate_file_name(file_name: Option<String>) -> Result<Option<String>, String> {
@@ -90,8 +177,8 @@ async fn download_video(
     let file_name = validate_file_name(file_name)?;
     let result_dir = get_result_dir()?;
     let lib_dir = get_lib_dir()?;
+    let ffmpeg_location = get_ffmpeg_location(&lib_dir)?;
     let ytdlp_path = lib_dir.join("yt-dlp.exe");
-    let ffmpeg_dir = lib_dir; // yt-dlpにはffmpeg.exeの「フォルダ」を渡すのが確実
 
     if !audio_only && quality == Some(0) {
         return Err("画質の指定が正しくありません".into());
@@ -102,12 +189,11 @@ async fn download_video(
     // 重いプロセス処理は spawn_blocking の中で回す
     tauri::async_runtime::spawn_blocking(move || {
         let mut command = Command::new(&ytdlp_path);
-        command
-            .arg(&url)
-            .arg("--ffmpeg-location")
-            .arg(&ffmpeg_dir)
-            .arg("--paths")
-            .arg(&result_dir);
+        command.arg(&url).arg("--paths").arg(&result_dir);
+
+        if let Some(ffmpeg_dir) = ffmpeg_location {
+            command.arg("--ffmpeg-location").arg(ffmpeg_dir);
+        }
 
         if audio_only {
             command.arg("--extract-audio");
@@ -266,6 +352,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             download_video,
+            ensure_ffmpeg_available,
             update_ytdlp,
             get_video_info,
             open_result_dir
